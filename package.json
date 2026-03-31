@@ -1,0 +1,31 @@
+{
+  "name": "bird-linkedin",
+  "version": "1.0.0",
+  "description": "LinkedIn CLI client using undocumented Voyager API with cookie auth",
+  "type": "module",
+  "bin": {
+    "bird-linkedin": "./dist/cli.js"
+  },
+  "main": "./dist/lib/index.js",
+  "types": "./dist/lib/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "linkedin",
+    "cli",
+    "voyager"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^13.1.0",
+    "kleur": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.12.0",
+    "typescript": "^5.7.3"
+  }
+}
