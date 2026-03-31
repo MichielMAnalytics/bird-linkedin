@@ -81,6 +81,10 @@ export const QUERY_IDS: Record<string, string> = {
   // Premium
   premiumUpsellSlot:
     'voyagerPremiumDashUpsellSlotContent.297ce76758cb2c07c82b30c1da9e97dc',
+
+  // Reactions
+  reactions:
+    'voyagerSocialDashReactions.b731222600772fd42464c0fe19bd722b',
 };
 
 // ── Defaults ───────────────────────────────────────────────────────────

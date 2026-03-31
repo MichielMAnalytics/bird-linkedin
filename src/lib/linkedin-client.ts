@@ -97,25 +97,24 @@ export class LinkedInClient extends LinkedInClientBase {
   /**
    * Get a user profile by public identifier (vanity name).
    *
-   * Uses GraphQL with voyagerIdentityDashProfiles queryId.
+   * Strategy:
+   * 1. Scrape the profile HTML page (most reliable — matches normal browser traffic)
+   * 2. Extract name from <title>, URN from page source, headline/location from meta/embedded data
+   * 3. Fall back to Voyager REST endpoint if scraping fails
    */
   async getProfile(publicId: string): Promise<ProfileData | null> {
     const handle = normalizeHandle(publicId);
 
-    // Try GraphQL vanity name lookup
+    // Strategy 1: Scrape the profile HTML page (stealthiest approach)
     try {
-      const data = await this.graphqlGet(
-        `(vanityName:${handle})`,
-        QUERY_IDS.profileByVanityName,
-        true
-      );
-      const profile = parseProfileFromGraphQL(data);
+      const html = await this.pageGet(`${LINKEDIN_BASE}/in/${encodeURIComponent(handle)}/`);
+      const profile = this.parseProfileFromHtml(html, handle);
       if (profile) return profile;
     } catch {
-      // Fall through to memberIdentity-based lookup
+      // Fall through
     }
 
-    // Fallback: dash/profiles REST endpoint
+    // Strategy 2: Voyager REST endpoint (may be deprecated for some profiles)
     try {
       const url = `${VOYAGER_API_BASE}/identity/dash/profiles?q=memberIdentity&memberIdentity=${encodeURIComponent(handle)}&decorationId=com.linkedin.voyager.dash.deco.identity.profile.WebTopCardCore-20`;
       const data = await this.rawGet(url);
@@ -139,6 +138,60 @@ export class LinkedInClient extends LinkedInClientBase {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Parse profile data from the LinkedIn profile HTML page.
+   * Extracts name from <title>, URN from embedded data, headline from page content.
+   */
+  private parseProfileFromHtml(html: string, handle: string): ProfileData | null {
+    // Name from title: "FirstName LastName | LinkedIn" or "FirstName LastName - Title | LinkedIn"
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+    if (!titleMatch) return null;
+
+    const titleText = titleMatch[1].replace(/\s*\|\s*LinkedIn\s*$/, '').trim();
+    if (!titleText || titleText === 'LinkedIn') return null;
+
+    // Title can be "First Last" or "First Last - Headline"
+    const dashIdx = titleText.indexOf(' - ');
+    let fullName: string;
+    let headline = '';
+    if (dashIdx > 0) {
+      fullName = titleText.substring(0, dashIdx).trim();
+      headline = titleText.substring(dashIdx + 3).trim();
+    } else {
+      fullName = titleText;
+    }
+
+    const nameParts = fullName.split(/\s+/);
+    const firstName = nameParts[0] || '';
+    const lastName = nameParts.slice(1).join(' ') || '';
+
+    // Profile URN (first fsd_profile URN found is typically the page owner)
+    const urnMatch = html.match(/urn:li:fsd_profile:([A-Za-z0-9_-]+)/);
+    const entityUrn = urnMatch ? `urn:li:fsd_profile:${urnMatch[1]}` : '';
+
+    // Location from meta or page content
+    const locationMatch = html.match(/"locationName"\s*:\s*"([^"]+)"/) ||
+      html.match(/"geoLocationName"\s*:\s*"([^"]+)"/);
+    const location = locationMatch?.[1];
+
+    // Try to get a better headline from embedded data
+    if (!headline) {
+      const headlineMatch = html.match(/"headline"\s*:\s*"([^"]+)"/) ||
+        html.match(/"occupation"\s*:\s*"([^"]+)"/);
+      if (headlineMatch) headline = headlineMatch[1];
+    }
+
+    return {
+      id: entityUrn,
+      firstName,
+      lastName,
+      headline,
+      publicIdentifier: handle,
+      entityUrn,
+      location,
+    };
   }
 
   // ── Feed ─────────────────────────────────────────────────
@@ -351,6 +404,136 @@ export class LinkedInClient extends LinkedInClientBase {
     return profiles;
   }
 
+  // ── Commenting ───────────────────────────────────────────
+
+  /**
+   * Resolve an activity ID/URL to the ugcPost threadUrn needed for comments.
+   * The mapping lives in updateMetadata.shareUrn of the feed/updates response.
+   */
+  private async resolveThreadUrn(postIdOrUrl: string): Promise<string> {
+    const id = parsePostId(postIdOrUrl);
+    const urn = activityUrn(id);
+
+    const data = await this.rawGet(`${VOYAGER_API_BASE}/feed/updates/${urn}`);
+    const included = data.included || [];
+
+    // Find the UpdateV2 entity and extract shareUrn from updateMetadata
+    // LinkedIn uses both urn:li:ugcPost:xxx and urn:li:share:xxx
+    for (const item of included) {
+      const shareUrn = item.updateMetadata?.shareUrn;
+      if (shareUrn && (shareUrn.includes('ugcPost') || shareUrn.includes('share'))) {
+        return shareUrn;
+      }
+    }
+
+    // Fallback: search all included for a ugcPost or share URN
+    const allJson = JSON.stringify(included);
+    const match = allJson.match(/urn:li:(?:ugcPost|share):\d+/);
+    if (match) return match[0];
+
+    throw new Error(`Could not resolve threadUrn for activity ${id}`);
+  }
+
+  /**
+   * Reply to a post (add a comment).
+   *
+   * Uses the voyagerSocialDashNormComments endpoint discovered from the real browser.
+   */
+  async replyToPost(postIdOrUrl: string, text: string): Promise<{ success: boolean; commentUrn?: string; error?: string }> {
+    await this.ensureInit();
+    await this.mutationJitter();
+
+    try {
+      const threadUrn = await this.resolveThreadUrn(postIdOrUrl);
+
+      const body = {
+        commentary: {
+          text,
+          attributesV2: [],
+          '$type': 'com.linkedin.voyager.dash.common.text.TextViewModel',
+        },
+        threadUrn,
+      };
+
+      const url = `${VOYAGER_API_BASE}/voyagerSocialDashNormComments?decorationId=com.linkedin.voyager.dash.deco.social.NormComment-43`;
+      const res = await this.fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          ...this.getHeaders(),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        return { success: false, error: `HTTP ${res.status}: ${errText.substring(0, 200)}` };
+      }
+
+      const result = await res.json().catch(() => ({})) as any;
+      const commentUrn = result?.data?.entityUrn || result?.data?.['*elements']?.[0] || '';
+
+      return { success: true, commentUrn };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // ── Reactions ────────────────────────────────────────────
+
+  /**
+   * React to a post (like, celebrate, love, insightful, funny, support).
+   *
+   * LinkedIn reaction types:
+   *   LIKE        - 👍 Like
+   *   PRAISE      - 👏 Celebrate / Support
+   *   EMPATHY     - ❤️ Love
+   *   INTEREST    - 💡 Insightful / Interesting
+   *   APPRECIATION - 🙌 Support (hands)
+   *   ENTERTAINMENT - 😂 Funny
+   */
+  async reactToPost(
+    postIdOrUrl: string,
+    reactionType: 'LIKE' | 'PRAISE' | 'EMPATHY' | 'INTEREST' | 'APPRECIATION' | 'ENTERTAINMENT' = 'LIKE'
+  ): Promise<{ success: boolean; error?: string }> {
+    await this.ensureInit();
+    await this.mutationJitter();
+
+    try {
+      const threadUrn = await this.resolveThreadUrn(postIdOrUrl);
+
+      const queryId = QUERY_IDS.reactions;
+      const url = `${VOYAGER_API_BASE}/graphql?action=execute&queryId=${queryId}`;
+
+      const body = {
+        variables: {
+          entity: { reactionType },
+          threadUrn,
+        },
+        queryId,
+        includeWebMetadata: true,
+      };
+
+      const res = await this.fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          ...this.getHeaders(),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        return { success: false, error: `HTTP ${res.status}: ${errText.substring(0, 200)}` };
+      }
+
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   // ── Posting (stubbed - not active yet) ───────────────────
 
   /**
@@ -358,12 +541,5 @@ export class LinkedInClient extends LinkedInClientBase {
    */
   async createPost(_text: string): Promise<{ success: boolean; error?: string }> {
     return { success: false, error: 'Posting is not yet implemented. Use --dry-run to preview.' };
-  }
-
-  /**
-   * Reply to a post (NOT YET ACTIVE - for future use)
-   */
-  async replyToPost(_postId: string, _text: string): Promise<{ success: boolean; error?: string }> {
-    return { success: false, error: 'Replying is not yet implemented. Use --dry-run to preview.' };
   }
 }
