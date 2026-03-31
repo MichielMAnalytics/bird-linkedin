@@ -61,6 +61,10 @@ export class LinkedInClientBase {
   /** @internal */ _initialized = false;
   /** @internal */ _initPromise: Promise<void> | null = null;
 
+  /** Rate limiter: timestamps of recent requests. */
+  private _requestTimestamps: number[] = [];
+  private _maxRequestsPerMinute = 30;
+
   static readonly API_BASE = VOYAGER_API_BASE;
   static readonly GRAPHQL_ENDPOINT = GRAPHQL_ENDPOINT;
 
@@ -69,6 +73,7 @@ export class LinkedInClientBase {
     this.timeout = options.timeout ?? 30_000;
     this.noJitter = options.noJitter ?? false;
     this.lang = options.lang ?? process.env.LI_LANG ?? 'en_US';
+    this._maxRequestsPerMinute = parseInt(process.env.LI_RATE_LIMIT || '30', 10);
 
     // Minimal cookie header until init runs
     const csrfToken = this.credentials.jsessionId.replace(/^"|"$/g, '');
@@ -338,16 +343,44 @@ export class LinkedInClientBase {
     await new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  // ── Rate Limiting ─────────────────────────────────────────
+
+  /**
+   * Wait if needed to stay within the rate limit (default: 30 req/min).
+   * Configurable via LI_RATE_LIMIT env var.
+   */
+  private async enforceRateLimit(): Promise<void> {
+    const now = Date.now();
+    const windowMs = 60_000;
+
+    // Prune timestamps older than 1 minute
+    this._requestTimestamps = this._requestTimestamps.filter(t => now - t < windowMs);
+
+    if (this._requestTimestamps.length >= this._maxRequestsPerMinute) {
+      const oldest = this._requestTimestamps[0];
+      const waitMs = windowMs - (now - oldest) + 100; // +100ms buffer
+      if (waitMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+      // Re-prune after waiting
+      this._requestTimestamps = this._requestTimestamps.filter(t => Date.now() - t < windowMs);
+    }
+
+    this._requestTimestamps.push(Date.now());
+  }
+
   // ── Fetch ─────────────────────────────────────────────────
 
   /**
    * Internal fetch that:
+   * - Enforces rate limiting (default 30 req/min)
    * - Uses redirect: 'manual' to capture Set-Cookie on 302s
    * - Follows up to MAX_REDIRECTS manually, merging cookies each time
    * - Checks for session invalidation (li_at=delete me)
    * - Supports timeout via AbortController
    */
   protected async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+    await this.enforceRateLimit();
     let currentUrl = url;
 
     for (let attempt = 0; attempt <= MAX_REDIRECTS; attempt++) {

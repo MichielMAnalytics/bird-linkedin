@@ -686,12 +686,63 @@ export class LinkedInClient extends LinkedInClientBase {
     }
   }
 
-  // ── Posting (stubbed - not active yet) ───────────────────
+  // ── Posting ──────────────────────────────────────────────
 
   /**
-   * Create a new post (NOT YET ACTIVE - for future use)
+   * Create a new text post on LinkedIn.
+   *
+   * Uses the contentcreation/normShares endpoint (confirmed working 2026-03-31).
+   * Posts are public by default. Set connectionsOnly=true for connections-only visibility.
    */
-  async createPost(_text: string): Promise<{ success: boolean; error?: string }> {
-    return { success: false, error: 'Posting is not yet implemented. Use --dry-run to preview.' };
+  async createPost(
+    text: string,
+    options?: { connectionsOnly?: boolean }
+  ): Promise<{ success: boolean; postUrl?: string; activityUrn?: string; error?: string }> {
+    await this.ensureInit();
+    await this.mutationJitter();
+
+    try {
+      const body = {
+        visibleToConnectionsOnly: options?.connectionsOnly ?? false,
+        externalAudienceProviders: [],
+        commentaryV2: {
+          text,
+          attributes: [],
+        },
+        origin: 'FEED',
+        allowedCommentersScope: 'ALL',
+        showPremiumAnalytics: false,
+      };
+
+      const url = `${VOYAGER_API_BASE}/contentcreation/normShares`;
+      const res = await this.fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          ...this.getHeaders(),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        return { success: false, error: `HTTP ${res.status}: ${errText.substring(0, 200)}` };
+      }
+
+      const result = await res.json().catch(() => ({})) as any;
+      const shareUrn = result?.data?.status?.urn || '';
+      const toastUrl = result?.data?.status?.toastCtaUrl || '';
+      const activityUrn = result?.included?.find(
+        (i: any) => i.entityUrn?.includes('fs_updateV2')
+      )?.entityUrn?.match(/urn:li:activity:\d+/)?.[0] || '';
+
+      return {
+        success: true,
+        postUrl: toastUrl || (shareUrn ? `https://www.linkedin.com/feed/update/${shareUrn}` : ''),
+        activityUrn,
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 }

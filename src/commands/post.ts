@@ -8,11 +8,13 @@ type ReactionType = typeof REACTION_TYPES[number];
 export function registerPostCommands(program: Command): void {
   program
     .command('post <text>')
-    .description('Create a new post (not yet active)')
+    .description('Create a new post')
     .option('--dry-run', 'Preview without posting')
+    .option('--connections-only', 'Visible to connections only (default: public)')
     .action(async (text: string, opts, cmd) => {
       try {
-        const { client } = getContext(cmd.optsWithGlobals());
+        const globals = cmd.optsWithGlobals();
+        const { client, json } = getContext(globals);
 
         if (opts.dryRun) {
           printInfo('Dry run - would post:');
@@ -20,9 +22,16 @@ export function registerPostCommands(program: Command): void {
           return;
         }
 
-        const result = await client.createPost(text);
+        const result = await client.createPost(text, {
+          connectionsOnly: opts.connectionsOnly,
+        });
         if (result.success) {
-          printInfo('Post created!');
+          if (json) {
+            console.log(JSON.stringify({ success: true, postUrl: result.postUrl, activityUrn: result.activityUrn }));
+          } else {
+            printSuccess('Post created!');
+            if (result.postUrl) console.log(result.postUrl);
+          }
         } else {
           printErr(result.error || 'Failed to create post');
         }

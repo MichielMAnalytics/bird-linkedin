@@ -7,12 +7,14 @@ export function registerHomeCommands(program: Command): void {
     .command('home')
     .description('Show home feed')
     .option('-c, --count <n>', 'Number of posts', '10')
+    .option('-s, --start <n>', 'Start offset for pagination', '0')
     .action(async (opts, cmd) => {
       try {
         const globals = cmd.optsWithGlobals();
         const { client, json } = getContext(globals);
         const count = parseInt(opts.count, 10) || 10;
-        const posts = await client.getHomeFeed(count);
+        const start = parseInt(opts.start, 10) || 0;
+        const posts = await client.getHomeFeed(count, start);
 
         if (json) {
           outputResult(posts, true);
