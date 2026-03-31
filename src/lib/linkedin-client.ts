@@ -374,31 +374,183 @@ export class LinkedInClient extends LinkedInClientBase {
 
   /**
    * Search for people on LinkedIn.
-   * Scrapes people search results HTML page.
+   *
+   * Scrapes the people search results HTML page and parses structured
+   * person cards directly from the page text. This extracts name, headline,
+   * location, current role, and handle — no per-profile API calls needed.
+   *
+   * LinkedIn's SDUI renders cards with a consistent text pattern:
+   *   Name \n • 1ste/2de/3de+\n\nHeadline\n\nLocation\n\nHuidig: Role bij Company
    */
   async searchPeople(keywords: string, count = 10): Promise<ProfileData[]> {
     const encodedKeywords = encodeURIComponent(keywords);
 
-    // Fetch search results HTML page
     const searchUrl = `${LINKEDIN_BASE}/search/results/people/?keywords=${encodedKeywords}&origin=GLOBAL_SEARCH_HEADER`;
-
     const html = await this.pageGet(searchUrl);
 
-    // Extract public identifiers from the HTML
+    // Strategy 1: Parse structured text from the rendered page.
+    // The SDUI page embeds visible text in a predictable card pattern.
+    // We pair each /in/ handle with its surrounding card text.
+    const profiles = this.parsePeopleSearchResults(html, count);
+    if (profiles.length > 0) return profiles;
+
+    // Strategy 2 (fallback): just extract handles and look them up individually.
     const handles = [...new Set(
-      (html.match(/linkedin\.com\/in\/([a-zA-Z0-9_-]+)/g) || [])
-        .map(m => m.replace('linkedin.com/in/', ''))
-        .filter(h => h.length > 2 && h !== 'me')
+      (html.match(/\/in\/([a-zA-Z0-9_-]{3,})/g) || [])
+        .map(m => m.replace('/in/', ''))
+        .filter(h => h !== 'me')
     )];
 
-    const profiles: ProfileData[] = [];
+    const fallbackProfiles: ProfileData[] = [];
     for (const handle of handles.slice(0, count)) {
       try {
         const profile = await this.getProfile(handle);
-        if (profile) profiles.push(profile);
-      } catch {
-        // Skip failed lookups
+        if (profile) fallbackProfiles.push(profile);
+      } catch {}
+    }
+    return fallbackProfiles;
+  }
+
+  /**
+   * Parse people search results from LinkedIn's SDUI HTML.
+   *
+   * The page contains <a href="/in/handle"> links, and the visible page text
+   * (extracted via a simple tag stripper) has structured person cards.
+   * We match handles to their card text by proximity in the HTML.
+   */
+  private parsePeopleSearchResults(html: string, count: number): ProfileData[] {
+    // Step 1: Extract handle→name pairs from the HTML.
+    // LinkedIn SDUI renders <a href="/in/handle">...<span>Name</span>...</a>
+    // We find each /in/ link and look for the person's name near it.
+    const handleNamePairs: Array<{ handle: string; htmlIndex: number }> = [];
+    const seenHandles = new Set<string>();
+    const handleRegex = /\/in\/([a-zA-Z0-9_-]{3,})(?:\/|"|')/g;
+    let hMatch;
+    while ((hMatch = handleRegex.exec(html)) !== null) {
+      const h = hMatch[1];
+      if (!seenHandles.has(h) && h !== 'me') {
+        seenHandles.add(h);
+        handleNamePairs.push({ handle: h, htmlIndex: hMatch.index });
       }
+    }
+
+    // Step 2: Strip RSC payload before parsing visible text.
+    // RSC data lives in <script> tags and after the closing </html>.
+    // Also strip everything that looks like serialized JSON/RSC.
+    let cleanHtml = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')  // Remove all scripts
+      .replace(/\$L[0-9a-f]+/g, '')  // Remove RSC references
+      .split('</html>')[0] || html;  // Only keep content before </html>
+
+    // Strip HTML tags to get visible text
+    const visibleText = cleanHtml
+      .replace(/<(br|div|p|li|h[1-6]|section|tr)[^>]*>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#x27;/g, "'")
+      .replace(/&nbsp;/g, ' ')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n');
+
+    // Step 3: Parse person cards from visible text.
+    // Pattern: "Name • 1ste/2de/3de+"
+    const cardRegex = /([A-Z\u00C0-\u024F][^\n]{1,49}?)\s*[•·]\s*(?:1ste|2de|3de\+|1st|2nd|3rd\+)/g;
+    const cards: Array<{
+      name: string;
+      headline: string;
+      location: string;
+      currentRole: string;
+    }> = [];
+
+    let match;
+    while ((match = cardRegex.exec(visibleText)) !== null) {
+      const name = match[1].trim();
+      // Filter out RSC garbage: names must start with a letter, no special chars
+      if (name.length < 2 || name.length > 55) continue;
+      if (/[{}\[\]$\\]/.test(name)) continue;  // RSC artifacts
+      if (/^\d/.test(name)) continue;           // Starts with number
+
+      // Parse the next ~400 chars for headline, location, current role
+      const afterCard = visibleText.substring(match.index + match[0].length, match.index + match[0].length + 400);
+      const lines = afterCard.split('\n').map(l => l.trim()).filter(l => l && l.length > 2);
+
+      let headline = '';
+      let location = '';
+      let currentRole = '';
+
+      const skipPattern = /^(Bericht|Volgen|Connectie|Message|Follow|Connect|gemeenschappelijke|\d+K? volgers|meldingen|Overslaan|Mijn services|Zijn deze)/;
+      const locationPattern = /Nederland|Netherlands|Rotterdam|Amsterdam|Utrecht|Den Haag|Randstad|België|Belgium|London|United Kingdom|Verenigde Staten|United States|India|Germany|France|Singapore|España|Spanje|New York|en omgeving/;
+
+      for (const line of lines.slice(0, 10)) {
+        if (/[{}\[\]$\\]/.test(line)) break;  // Hit RSC data, stop
+        if (skipPattern.test(line)) continue;
+
+        if (line.startsWith('Huidig:') || line.startsWith('Current:') || line.startsWith('Vorig:') || line.startsWith('Previous:')) {
+          currentRole = line;
+          break;
+        }
+
+        // Headline comes FIRST (it's the line right after name+degree)
+        // Location comes SECOND (it has geographic keywords)
+        if (!headline) {
+          headline = line;
+        } else if (!location && locationPattern.test(line)) {
+          location = line;
+        }
+      }
+
+      cards.push({ name, headline, location, currentRole });
+    }
+
+    // Step 4: Match cards to handles.
+    // Try to match by name similarity first, then by order.
+    const profiles: ProfileData[] = [];
+    const usedHandles = new Set<string>();
+    const orderedHandles = handleNamePairs.map(p => p.handle);
+
+    for (const card of cards) {
+      if (profiles.length >= count) break;
+
+      let bestHandle = '';
+
+      // Match by name parts appearing in handle
+      for (const h of orderedHandles) {
+        if (usedHandles.has(h)) continue;
+        const hLower = h.toLowerCase();
+        const nameParts = card.name.toLowerCase().split(/\s+/);
+        if (nameParts.some(part => part.length > 2 && hLower.includes(part))) {
+          bestHandle = h;
+          break;
+        }
+      }
+
+      // Fallback: next unused handle
+      if (!bestHandle) {
+        for (const h of orderedHandles) {
+          if (!usedHandles.has(h)) {
+            bestHandle = h;
+            break;
+          }
+        }
+      }
+
+      if (!bestHandle) continue;
+      usedHandles.add(bestHandle);
+
+      const nameParts = card.name.split(/\s+/);
+      profiles.push({
+        id: '',
+        firstName: nameParts[0] || '',
+        lastName: nameParts.slice(1).join(' ') || '',
+        headline: card.headline || card.currentRole || '',
+        publicIdentifier: bestHandle,
+        entityUrn: '',
+        location: card.location || undefined,
+      });
     }
 
     return profiles;
