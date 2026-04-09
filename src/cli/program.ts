@@ -6,6 +6,7 @@ import { registerUserPostsCommands } from '../commands/user-posts.js';
 import { registerSearchCommands } from '../commands/search.js';
 import { registerProfileCommands } from '../commands/profile.js';
 import { registerPostCommands } from '../commands/post.js';
+import { registerMessagingCommands } from '../commands/messaging.js';
 
 export function createProgram(): Command {
   const program = new Command();
@@ -27,6 +28,7 @@ export function createProgram(): Command {
   registerSearchCommands(program);
   registerProfileCommands(program);
   registerPostCommands(program);
+  registerMessagingCommands(program);
 
   return program;
 }

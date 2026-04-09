@@ -58,6 +58,146 @@ export interface SearchResult {
   cursor?: string;
 }
 
+export interface ConversationData {
+  entityUrn: string;
+  participantUrns: string[];
+  participantName: string;
+  participantHandle: string;
+  lastMessageText: string;
+  lastMessageTime: string;
+  unread: boolean;
+  unreadCount: number;
+}
+
+export interface MessageData {
+  entityUrn: string;
+  text: string;
+  senderUrn: string;
+  senderName: string;
+  timestamp: string;
+  deliveredAt: number;
+}
+
+/**
+ * Parse conversations from messaging GraphQL response.
+ */
+export function parseConversationsFromIncluded(included: any[]): ConversationData[] {
+  if (!included || !Array.isArray(included)) return [];
+
+  const conversations = included.filter(
+    (i) => i['$type'] === 'com.linkedin.messenger.Conversation'
+  );
+
+  // Build participant lookup
+  const participantMap = new Map<string, any>();
+  for (const item of included) {
+    if (item['$type'] === 'com.linkedin.messenger.MessagingParticipant') {
+      participantMap.set(item.entityUrn, item);
+    }
+  }
+
+  // Build message lookup for last message
+  const messageMap = new Map<string, any>();
+  for (const item of included) {
+    if (item['$type'] === 'com.linkedin.messenger.Message') {
+      messageMap.set(item.entityUrn, item);
+    }
+  }
+
+  // Helper to get own profile ID from conversation URN
+  // Format: urn:li:msg_conversation:(urn:li:fsd_profile:SELF_ID,thread)
+  function getSelfIdFromConvUrn(convUrn: string): string {
+    const match = convUrn.match(/fsd_profile:(ACoAA[A-Za-z0-9_-]+)/);
+    return match ? match[1] : '';
+  }
+
+  return conversations.map((conv) => {
+    const partUrns: string[] = conv['*conversationParticipants'] || [];
+    const selfId = getSelfIdFromConvUrn(conv.entityUrn || '');
+
+    // Find the other participant (not self)
+    let participantName = '';
+    let participantHandle = '';
+    for (const pUrn of partUrns) {
+      const participant = participantMap.get(pUrn);
+      if (!participant) continue;
+      // Skip self
+      const pId = pUrn.match(/(ACoAA[A-Za-z0-9_-]+)/)?.[1];
+      if (pId && pId === selfId) continue;
+
+      // Names are in participantType.member.firstName/lastName
+      const member = participant.participantType?.member;
+      if (member) {
+        const firstName = member.firstName?.text || '';
+        const lastName = member.lastName?.text || '';
+        participantName = `${firstName} ${lastName}`.trim();
+        // Handle from profileUrl: https://www.linkedin.com/in/HANDLE_OR_ID
+        const profileUrl = member.profileUrl || '';
+        const handleMatch = profileUrl.match(/\/in\/([^/?]+)/);
+        participantHandle = handleMatch ? handleMatch[1] : '';
+      }
+    }
+
+    // Fallback to shortHeadlineText
+    if (!participantName && conv.shortHeadlineText?.text) {
+      participantName = conv.shortHeadlineText.text;
+    }
+
+    // Get last message
+    const lastMsgUrn = conv['*lastMessage'];
+    const lastMsg = lastMsgUrn ? messageMap.get(lastMsgUrn) : null;
+    const lastMessageText = lastMsg?.body?.text || '';
+
+    return {
+      entityUrn: conv.entityUrn || '',
+      participantUrns: partUrns,
+      participantName,
+      participantHandle,
+      lastMessageText,
+      lastMessageTime: conv.lastActivityAt ? new Date(conv.lastActivityAt).toISOString() : '',
+      unread: !conv.read,
+      unreadCount: conv.unreadCount ?? 0,
+    };
+  });
+}
+
+/**
+ * Parse messages from messaging GraphQL response.
+ */
+export function parseMessagesFromIncluded(included: any[]): MessageData[] {
+  if (!included || !Array.isArray(included)) return [];
+
+  const messages = included.filter(
+    (i) => i['$type'] === 'com.linkedin.messenger.Message' && i.body
+  );
+
+  // Build participant lookup for sender names
+  const msgParticipantMap = new Map<string, any>();
+  for (const item of included) {
+    if (item['$type'] === 'com.linkedin.messenger.MessagingParticipant') {
+      msgParticipantMap.set(item.entityUrn, item);
+    }
+  }
+
+  return messages.map((msg) => {
+    const senderUrn = msg.senderUrn || msg['*sender'] || '';
+    const participant = msgParticipantMap.get(senderUrn);
+    const member = participant?.participantType?.member;
+    const senderName = member
+      ? `${member.firstName?.text || ''} ${member.lastName?.text || ''}`.trim()
+      : senderUrn;
+
+    return {
+      entityUrn: msg.entityUrn || '',
+      text: msg.body?.text || '',
+      senderUrn,
+      senderName,
+      timestamp: msg.deliveredAt ? new Date(msg.deliveredAt).toISOString() : '',
+      deliveredAt: msg.deliveredAt || 0,
+    };
+  }).sort((a, b) => a.deliveredAt - b.deliveredAt);
+}
+
 /**
  * Extract the activity ID from a URN like urn:li:activity:1234567890
  */

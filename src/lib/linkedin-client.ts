@@ -17,18 +17,25 @@ import {
   VOYAGER_API_BASE,
   GRAPHQL_ENDPOINT,
   LINKEDIN_BASE,
+  MESSAGING_GRAPHQL_ENDPOINT,
+  MESSAGING_QUERY_IDS,
 } from './linkedin-client-constants.js';
 import {
   PostData,
   CommentData,
   ProfileData,
+  ConversationData,
+  MessageData,
   parsePostsFromIncluded,
   parseCommentsFromIncluded,
   parseProfileFromGraphQL,
+  parseConversationsFromIncluded,
+  parseMessagesFromIncluded,
   parsePostId,
   activityUrn,
   normalizeHandle,
 } from './linkedin-client-utils.js';
+import { randomUUID } from 'node:crypto';
 
 export class LinkedInClient extends LinkedInClientBase {
 
@@ -681,6 +688,255 @@ export class LinkedInClient extends LinkedInClientBase {
       }
 
       return { success: true };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // ── Messaging ────────────────────────────────────────────
+
+  /**
+   * Get the authenticated user's fsd_profile URN (needed for messaging).
+   * Extracts the member ID from getMe() and converts to fsd_profile format.
+   */
+  private async getMailboxUrn(): Promise<string> {
+    const me = await this.getMe();
+    const memberId = me.entityUrn.match(/(ACoAA[A-Za-z0-9_-]+)/)?.[1];
+    if (!memberId) throw new Error('Could not extract member ID from profile');
+    return `urn:li:fsd_profile:${memberId}`;
+  }
+
+  /**
+   * Encode a URN for use inside messaging GraphQL variable values.
+   * Colons → %3A, inner parens → %28/%29, commas → %2C
+   */
+  private encodeUrnForMessaging(urn: string): string {
+    return urn.replace(/:/g, '%3A').replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/,/g, '%2C');
+  }
+
+  /**
+   * Fetch from the messaging-specific GraphQL endpoint.
+   * Uses the same REST headers but hits voyagerMessagingGraphQL/graphql.
+   */
+  private async messagingGraphqlGet(variables: string, queryId: string): Promise<any> {
+    await this.ensureInit();
+    const url = `${MESSAGING_GRAPHQL_ENDPOINT}?queryId=${encodeURIComponent(queryId)}&variables=${variables}`;
+    const res = await this.fetchWithTimeout(url, {
+      method: 'GET',
+      headers: this.getHeaders('GET'),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`LinkedIn Messaging GraphQL error ${res.status}: ${text.substring(0, 300)}`);
+    }
+    return await res.json();
+  }
+
+  /**
+   * List recent conversations (inbox).
+   * Supports pagination via nextCursor for loading older conversations.
+   */
+  async getConversations(count = 20, cursor?: string): Promise<{ conversations: ConversationData[]; nextCursor?: string }> {
+    const mailboxUrn = await this.getMailboxUrn();
+    const encodedMailboxUrn = this.encodeUrnForMessaging(mailboxUrn);
+    let vars = `(query:(predicateUnions:List((conversationCategoryPredicate:(category:INBOX)))),count:${count},mailboxUrn:${encodedMailboxUrn}`;
+    if (cursor) {
+      vars += `,nextCursor:${cursor}`;
+    }
+    vars += ')';
+    const data = await this.messagingGraphqlGet(vars, MESSAGING_QUERY_IDS.conversations);
+    const conversations = parseConversationsFromIncluded(data.included);
+    const nextCursor = data.data?.data?.messengerConversationsByCategoryQuery?.metadata?.nextCursor;
+    return { conversations, nextCursor };
+  }
+
+  /**
+   * Get messages in a conversation by conversation URN.
+   */
+  async getMessages(conversationUrn: string, count = 50): Promise<MessageData[]> {
+    const encodedConvUrn = this.encodeUrnForMessaging(conversationUrn);
+    const vars = `(conversationUrn:${encodedConvUrn},count:${count})`;
+    const data = await this.messagingGraphqlGet(vars, MESSAGING_QUERY_IDS.messages);
+    return parseMessagesFromIncluded(data.included);
+  }
+
+  /**
+   * Find a conversation with a specific person by handle or name.
+   *
+   * Strategy:
+   * 1. Search existing conversations by participant name (case-insensitive, partial match)
+   * 2. Try profile lookup by handle → match against conversation participant URNs
+   * 3. Fall back to people search for new conversations
+   */
+  async findConversation(handleOrName: string): Promise<{ conversationUrn: string; recipientUrn: string } | null> {
+    const query = handleOrName.toLowerCase().trim();
+
+    // Strategy 1: Match by participant name in existing conversations (paginate up to 3 pages)
+    let cursor: string | undefined;
+    const allConversations: ConversationData[] = [];
+    for (let page = 0; page < 3; page++) {
+      const result = await this.getConversations(20, cursor);
+      allConversations.push(...result.conversations);
+      // Check this batch for a name match
+      const match = result.conversations.find(c => {
+        const name = c.participantName.toLowerCase();
+        return name && (name.includes(query) || query.includes(name));
+      });
+      if (match) {
+        const mailboxUrn = await this.getMailboxUrn();
+        const selfId = mailboxUrn.match(/(ACoAA[A-Za-z0-9_-]+)/)?.[1];
+        const recipientPUrn = match.participantUrns.find(u => {
+          const id = u.match(/(ACoAA[A-Za-z0-9_-]+)/)?.[1];
+          return id && id !== selfId;
+        });
+        const recipientId = recipientPUrn?.match(/(ACoAA[A-Za-z0-9_-]+)/)?.[1];
+        const recipientUrn = recipientId ? `urn:li:fsd_profile:${recipientId}` : '';
+        return { conversationUrn: match.entityUrn, recipientUrn };
+      }
+      cursor = result.nextCursor;
+      if (!cursor) break;
+    }
+    const conversations = allConversations;
+
+    // Strategy 2: Try profile lookup by handle → match against conversations
+    const handle = normalizeHandle(handleOrName);
+    const profile = await this.getProfile(handle);
+    if (profile?.entityUrn) {
+      const recipientId = profile.entityUrn.match(/(ACoAA[A-Za-z0-9_-]+)/)?.[1];
+      if (recipientId) {
+        for (const conv of conversations) {
+          if (conv.participantUrns.some(u => u.includes(recipientId))) {
+            return { conversationUrn: conv.entityUrn, recipientUrn: profile.entityUrn };
+          }
+        }
+        // No existing conversation — return URN for new conversation
+        return { conversationUrn: '', recipientUrn: profile.entityUrn };
+      }
+    }
+
+    // Strategy 3: People search for new conversations
+    const people = await this.searchPeople(handleOrName, 5);
+    for (const person of people) {
+      if (person.entityUrn) {
+        return { conversationUrn: '', recipientUrn: person.entityUrn };
+      }
+      // Try to get full profile from handle
+      if (person.publicIdentifier) {
+        const fullProfile = await this.getProfile(person.publicIdentifier);
+        if (fullProfile?.entityUrn) {
+          return { conversationUrn: '', recipientUrn: fullProfile.entityUrn };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Send a direct message to a conversation.
+   */
+  async sendMessage(
+    conversationUrn: string,
+    text: string
+  ): Promise<{ success: boolean; messageUrn?: string; error?: string }> {
+    await this.ensureInit();
+    await this.mutationJitter();
+
+    try {
+      const mailboxUrn = await this.getMailboxUrn();
+
+      const body = {
+        message: {
+          body: { attributes: [], text },
+          renderContentUnions: [],
+          conversationUrn,
+          originToken: randomUUID(),
+        },
+        mailboxUrn,
+        trackingId: randomUUID().replace(/-/g, '').substring(0, 16),
+        dedupeByClientGeneratedToken: false,
+      };
+
+      const url = `${VOYAGER_API_BASE}/voyagerMessagingDashMessengerMessages?action=createMessage`;
+      const res = await this.fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          ...this.getHeaders('POST'),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        return { success: false, error: `HTTP ${res.status}: ${errText.substring(0, 200)}` };
+      }
+
+      const result = await res.json().catch(() => ({})) as any;
+      const messageUrn = result?.data?.['*value'] || '';
+      return { success: true, messageUrn };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Send a DM to a person by handle or name.
+   * Finds or creates the conversation automatically.
+   */
+  async sendDM(
+    handleOrName: string,
+    text: string
+  ): Promise<{ success: boolean; messageUrn?: string; recipientName?: string; error?: string }> {
+    const found = await this.findConversation(handleOrName);
+    if (!found) {
+      return { success: false, error: `Could not find user "${handleOrName}"` };
+    }
+
+    if (found.conversationUrn) {
+      // Existing conversation — send directly
+      const result = await this.sendMessage(found.conversationUrn, text);
+      return { ...result, recipientName: handleOrName };
+    }
+
+    // No existing conversation — create one via the same endpoint
+    // but with recipients instead of conversationUrn
+    await this.ensureInit();
+    await this.mutationJitter();
+
+    try {
+      const mailboxUrn = await this.getMailboxUrn();
+
+      const body = {
+        message: {
+          body: { attributes: [], text },
+          renderContentUnions: [],
+          originToken: randomUUID(),
+        },
+        mailboxUrn,
+        recipients: [found.recipientUrn],
+        trackingId: randomUUID().replace(/-/g, '').substring(0, 16),
+        dedupeByClientGeneratedToken: false,
+      };
+
+      const url = `${VOYAGER_API_BASE}/voyagerMessagingDashMessengerMessages?action=createMessage`;
+      const res = await this.fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          ...this.getHeaders('POST'),
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        return { success: false, error: `HTTP ${res.status}: ${errText.substring(0, 200)}` };
+      }
+
+      const result = await res.json().catch(() => ({})) as any;
+      const messageUrn = result?.data?.['*value'] || '';
+      return { success: true, messageUrn, recipientName: handleOrName };
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
     }

@@ -87,6 +87,15 @@ export const QUERY_IDS: Record<string, string> = {
     'voyagerSocialDashReactions.b731222600772fd42464c0fe19bd722b',
 };
 
+// ── Messaging ─────────────────────────────────────────────────────────
+
+export const MESSAGING_GRAPHQL_ENDPOINT = `${VOYAGER_API_BASE}/voyagerMessagingGraphQL/graphql`;
+
+export const MESSAGING_QUERY_IDS: Record<string, string> = {
+  conversations: 'messengerConversations.9501074288a12f3ae9e3c7ea243bccbf',
+  messages: 'messengerMessages.5846eeb71c981f11e0134cb6626cc314',
+};
+
 // ── Defaults ───────────────────────────────────────────────────────────
 
 export const DEFAULT_POST_COUNT = 10;
