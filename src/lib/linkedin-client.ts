@@ -900,7 +900,7 @@ export class LinkedInClient extends LinkedInClientBase {
     }
 
     // No existing conversation — create one via the same endpoint
-    // but with recipients instead of conversationUrn
+    // but with hostRecipientUrns instead of conversationUrn
     await this.ensureInit();
     await this.mutationJitter();
 
@@ -910,13 +910,13 @@ export class LinkedInClient extends LinkedInClientBase {
       const body = {
         message: {
           body: { attributes: [], text },
-          renderContentUnions: [],
           originToken: randomUUID(),
+          renderContentUnions: [],
         },
         mailboxUrn,
-        recipients: [found.recipientUrn],
         trackingId: randomUUID().replace(/-/g, '').substring(0, 16),
         dedupeByClientGeneratedToken: false,
+        hostRecipientUrns: [found.recipientUrn],
       };
 
       const url = `${VOYAGER_API_BASE}/voyagerMessagingDashMessengerMessages?action=createMessage`;
